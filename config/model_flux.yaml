@@ -1,4 +1,4 @@
 model:
   name: flux_depth_pipeline
-  pretrained_path: stable-diffusion-2-1
+  pretrained_path: FLUX.1-dev
   latent_scale_factor: 0.18215

@@ -1,4 +1,5 @@
 import logging
+import os
 import numpy as np
 import torch
 import PIL
@@ -41,7 +42,6 @@ from .util.image_util import (
     resize_max_res,
 )
 
-logger = logging.get_logger(__name__)
 
 @dataclass
 class FluxDepthPipelineOutput(BaseOutput):
@@ -56,7 +56,9 @@ class FluxDepthPipelineOutput(BaseOutput):
             passed to the decoder.
     """
 
-    images: Union[List[PIL.Image.Image], np.ndarray]
+    depth_np: np.ndarray
+    depth_colored: Union[None, Image.Image]
+    uncertainty: Union[None, np.ndarray]
 
 class FluxDepthPipeline(DiffusionPipeline):
     
@@ -136,15 +138,10 @@ class FluxDepthPipeline(DiffusionPipeline):
 
         return latents, latent_image_ids
     
-    def load_prompt_embeds(
-        self,
-        empty_prompt_embeds,
-        empty_pooled_prompt_embeds,
-        text_ids,
-    ):
-        self.empty_prompt_embeds = empty_prompt_embeds
-        self.empty_pooled_prompt_embeds = empty_pooled_prompt_embeds
-        self.text_ids = text_ids
+    def load_prompt_embeds(self, prompt_embed_dir: str):
+        self.empty_prompt_embeds = torch.load(os.path.join(prompt_embed_dir, "prompt_embeds.pt"))
+        self.empty_pooled_prompt_embeds = torch.load(os.path.join(prompt_embed_dir, "pooled_prompt_embeds.pt"))
+        self.text_ids = torch.load(os.path.join(prompt_embed_dir, "text_ids.pt"))
 
     @staticmethod
     def _prepare_latent_image_ids(batch_size, height, width, device, dtype):
@@ -195,7 +192,7 @@ class FluxDepthPipeline(DiffusionPipeline):
         Returns:
             latents ('torch.Tensor'):   Image latents.
         """
-        latents = self.vae.encode(images).latent_dist.mode()
+        latents = self.vae.encode(images.to(self.vae.dtype)).latent_dist.mode()
         latents = (latents - self.vae.config.shift_factor) * self.vae.config.scaling_factor
         
         return latents
@@ -276,15 +273,16 @@ class FluxDepthPipeline(DiffusionPipeline):
         )
 
         if self.transformer.config.guidance_embeds:
-            guidance = torch.full([1], guidance_scale, device=self.device, dtype=self.dtype)
+            guidance = torch.full([1], guidance_scale, device=self.device, dtype=torch.float32)
             guidance = guidance.expand(batch_size)
         else:
             guidance = None
         
-        timestep = torch.tensor([1.0], device=self.device)
+        timestep = torch.tensor(0, device=self.device, dtype=torch.float32)
+        timestep = timestep.expand(batch_size)
 
         # Forward once!
-        pred_depth_latents = self.transformer(
+        model_pred = self.transformer(
             hidden_states=rgb_latents,
             timestep=timestep,
             guidance=guidance,
@@ -295,13 +293,15 @@ class FluxDepthPipeline(DiffusionPipeline):
             return_dict=False,
         )[0]
 
+        pred_depth_latents = rgb_latents - (1.0 - 0.0) * model_pred
+
         depth_latents = self._unpack_latents(
             pred_depth_latents,
             height=h*self.vae_scale_factor,
             width=w*self.vae_scale_factor,
             vae_scale_factor=self.vae_scale_factor,
         )
-        depth = self.decode_depth(pred_depth_latents)
+        depth = self.decode_depth(depth_latents)
         depth = torch.clip(depth, -1.0, 1.0)
 
         # denormalize the depths: [-1, 1] -> [0, 1]
@@ -315,7 +315,7 @@ class FluxDepthPipeline(DiffusionPipeline):
                 antialias=True,
             )
         depth = depth.squeeze()
-        depth = depth.cpu().numpy()
+        depth = depth.cpu().float().numpy()
         depth = depth.clip(0, 1)
 
         # Colorize

@@ -28,12 +28,9 @@
 # If you find Marigold useful, we kindly ask you to cite our papers.
 # --------------------------------------------------------------------------
 
-from .marigold_depth_trainer import MarigoldDepthTrainer
-
 from .flux_depth_trainer import FluxDepthTrainer
 
 trainer_cls_name_dict = {
-    "MarigoldDepthTrainer": MarigoldDepthTrainer,
     "FluxDepthTrainer": FluxDepthTrainer,
 }
 

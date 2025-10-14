@@ -59,6 +59,9 @@ from src.util.lr_scheduler import IterExponential
 from src.util.metric import MetricTracker
 from src.util.multi_res_noise import multi_res_noise_like
 from src.util.seeding import generate_seed_sequence
+from src.util.flux_utils import (
+    set_flux_transformer_lora,
+)
 
 from diffusers import DDPMScheduler
 from diffusers.training_utils import compute_density_for_timestep_sampling
@@ -93,22 +96,41 @@ class FluxDepthTrainer:
         self.accumulation_steps: int = accumulation_steps
 
         # Encode empty text prompt
-        self.model.encode_empty_text()
-        self.empty_text_embed = self.model.empty_text_embed.detach().clone().to(device)
-
-        if self.cfg.enable_gradient_checkpointing:
-            self.model.unet.enable_xformers_memory_efficient_attention()
-
-        if self.cfg.enable_gradient_checkpointing:
-            self.model.unet.enable_gradient_checkpointing()
+        self.model.load_prompt_embeds(self.cfg.prompt_embeds_dir)
+        self.empty_prompt_embeds = self.model.empty_prompt_embeds.detach().clone().to(device)
+        self.empty_pooled_prompt_embeds = self.model.empty_pooled_prompt_embeds.detach().clone().to(device)
+        self.text_ids = self.model.text_ids.detach().clone().to(device)
 
         # Trainability
+        weight_dtype = torch.float32
+        if self.cfg.mixed_precision == 'fp16':
+            weight_dtype = torch.float16
+        elif self.cfg.mixed_precision == 'bf16':
+            weight_dtype = torch.bfloat16        
+        self.weight_dtype = weight_dtype
+
         self.model.vae.requires_grad_(False)
-        self.model.text_encoder.requires_grad_(False)
-        self.model.unet.requires_grad_(True)
+        self.model.transformer.requires_grad_(False)
+
+        self.model.transformer = set_flux_transformer_lora(
+            self.model.transformer,
+            rank=self.cfg.lora.rank,
+            alpha=self.cfg.lora.alpha,
+            target_modules=self.cfg.lora.modules,
+        )
+
+        if self.cfg.enable_xformers_memory_efficient_attention:
+            self.model.transformer.enable_xformers_memory_efficient_attention()
+        
+        if self.cfg.enable_gradient_checkpointing:
+            self.model.transformer.enable_gradient_checkpointing()
+
+        if self.cfg.allow_tf32 and torch.cuda.is_available():
+            torch.backends.cuda.matmul.allow_tf32 = True
 
         # Optimizer !should be defined after input layer is adapted
         lr = self.cfg.lr
+        trainable_parameters = list(filter(lambda p: p.requires_grad, self.model.transformer.parameters()))
         if self.cfg.use_8bit_adam:
             try:
                 import bitsandbytes as bnb
@@ -117,9 +139,9 @@ class FluxDepthTrainer:
                     "To use 8-bit Adam, please install the bitsandbytes library: `pip install bitsandbytes`."
                 )
             
-            self.optimizer = bnb.optim.AdamW8bit(self.model.unet.parameters(), lr=lr)
+            self.optimizer = bnb.optim.AdamW8bit(trainable_parameters, lr=lr)
         else:
-            self.optimizer = Adam(self.model.unet.parameters(), lr=lr)
+            self.optimizer = Adam(trainable_parameters, lr=lr)
 
         # LR scheduler
         lr_func = IterExponential(
@@ -132,23 +154,11 @@ class FluxDepthTrainer:
         # Loss
         self.loss = get_loss(loss_name=self.cfg.loss.name, **self.cfg.loss.kwargs)
 
-        # Training noise scheduler
-        # NOTE 1) Original Stable Diffusion 2 uses total 1000 timesteps (999, 998, ..., 0),
-        #         while, Flow matching scheduler uses total 1000 timesteps (1000, 999, ..., 1).
-        #         Here, we -1 the timestep before injecting into the unet.
-
-        if not isinstance(self.model.scheduler, FlowMatchEulerDiscreteScheduler):
-            scheduler = self.load_scheduler()
-            self.model.scheduler = scheduler
-        
+        # Training noise scheduler    
         self.training_scheduler = copy.deepcopy(self.model.scheduler)
-
-        self.training_timesteps = self.training_scheduler.timesteps.long()  # ['1000', '999', ..., '1']
-        self.training_sigmas = self.training_scheduler.sigmas               # ['1.0', '0.999', ... '0.001']
-        self.num_train_timesteps = self.model.scheduler.config.num_train_timesteps
-
-        # Noising strength for posterior sampling
-        self.do_diffuse_latents = self.model.noising_strength > 0
+        self.training_timesteps = self.training_scheduler.timesteps                 # ['1000.0', '999.0', ..., '1.0']
+        self.training_sigmas = self.training_scheduler.sigmas                       # ['1.0', '0.999', ... '0.001']
+        self.num_train_timesteps = self.model.scheduler.config.num_train_timesteps  # 1000
 
         # Eval metrics
         self.metric_funcs = [getattr(metric, _met) for _met in cfg.eval.eval_metrics]
@@ -165,6 +175,10 @@ class FluxDepthTrainer:
         ), f"Main eval metric `{self.main_val_metric}` not found in evaluation metrics."
 
         self.best_metric = 1e8 if "minimize" == self.main_val_metric_goal else -1e8
+
+        # FLUX parameters
+        self.guidance_scale = self.cfg.guidance_scale
+        self.vae_scale_factor = self.model.vae_scale_factor
 
         # Settings
         self.max_epoch = self.cfg.max_epoch
@@ -184,47 +198,9 @@ class FluxDepthTrainer:
         self.in_evaluation = False
         self.global_seed_sequence: List = []  # consistent global seed sequence, used to seed random generator, to ensure consistency when resuming
 
-        # MeanFlow variables
-        self.weighting_scheme = self.cfg.meanflow.weighting_scheme
-        self.logit_mean = self.cfg.meanflow.logit_mean
-        self.logit_std = self.cfg.meanflow.logit_std
-        self.mode_scale = self.cfg.meanflow.mode_scale
-        self.ratio_r_not_equal_t = self.cfg.meanflow.ratio_r_not_equal_t
+        # TODO: Path interpolation
+        self.max_iter_glowd = self.cfg.max_iter_glowd
 
-        # Path interpolation 
-
-        # self.norm_eps = 1.0
-
-    def _replace_unet_conv_in(self):
-        # replace the first layer to accept 8 in_channels
-        _weight = self.model.unet.conv_in.weight.clone()  # [320, 4, 3, 3]
-        _bias = self.model.unet.conv_in.bias.clone()  # [320]
-        _weight = _weight.repeat((1, 2, 1, 1))  # Keep selected channel(s)
-        # half the activation magnitude
-        _weight *= 0.5
-        # new conv_in channel
-        _n_convin_out_channel = self.model.unet.conv_in.out_channels
-        _new_conv_in = Conv2d(
-            8, _n_convin_out_channel, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1)
-        )
-        _new_conv_in.weight = Parameter(_weight)
-        _new_conv_in.bias = Parameter(_bias)
-        self.model.unet.conv_in = _new_conv_in
-        logging.info("Unet conv_in layer is replaced")
-        # replace config
-        self.model.unet.config["in_channels"] = 8
-        logging.info("Unet config is updated")
-        return
-    
-    def load_scheduler(self, scheduler_config_path=None):
-        if scheduler_config_path is not None:
-            scheduler = FlowMatchEulerDiscreteScheduler.from_config(
-                os.path.join(scheduler_config_path)
-            )
-        else:
-            scheduler = FlowMatchEulerDiscreteScheduler() # use default setting
-
-        return scheduler
     
     def path_interpolation(
         self,
@@ -233,6 +209,7 @@ class FluxDepthTrainer:
         source,
         target
     ):
+        pass
         
 
     def time_interpolation(self, source_latent, timesteps, target_latent, eps=5e-1):
@@ -307,7 +284,7 @@ class FluxDepthTrainer:
 
             # Skip previous batches when resume
             for batch in skip_first_batches(self.train_loader, self.n_batch_in_epoch):
-                self.model.unet.train()
+                self.model.transformer.train()
 
                 # globally consistent random generators
                 if self.seed is not None:
@@ -320,54 +297,62 @@ class FluxDepthTrainer:
                 # >>> With gradient accumulation >>>
 
                 # Get data
-                rgb = batch["rgb_norm"].to(device)
+                rgb = batch["rgb_norm"].to(device)                              # [b, 3, H, W]
                 depth_gt_for_latent = batch[self.gt_depth_type].to(device)
 
+                batch_size, _, height, width = rgb.shape
+
                 if self.gt_mask_type is not None:
+                    num_channels_latents = self.model.transformer.config.in_channels // 4
                     valid_mask_for_latent = batch[self.gt_mask_type].to(device)
                     invalid_mask = ~valid_mask_for_latent
                     valid_mask_down = ~torch.max_pool2d(
                         invalid_mask.float(), 8, 8
                     ).bool()
-                    valid_mask_down = valid_mask_down.repeat((1, 4, 1, 1))
-
-                batch_size = rgb.shape[0]
+                    valid_mask_down = valid_mask_down.repeat((1, num_channels_latents, 1, 1))
 
                 with torch.no_grad():
                     # Encode image
-                    rgb_latent = self.encode_rgb(rgb)  # [B, 4, h, w]
+                    rgb_latent, packed_rgb_latent, rgb_latent_image_ids = self.prepare_latents(images=rgb)
 
                     # Encode GT depth
                     gt_target_latent = self.encode_depth(
                         depth_gt_for_latent
                     )  # [B, 4, h, w]
 
-                # prepare latents for model input
-                latents = rgb_latent.clone()
-                if self.do_diffuse_latents:
-                    latents = self.model.diffuse_sample(latents)
-
                 # Text embedding
-                text_embed = self.empty_text_embed.to(device).repeat(
-                    (batch_size, 1, 1)
-                )  # [B, 77, 1024]
-                
+                prompt_embeds = self.empty_prompt_embeds.to(device).repeat(batch_size, 1, 1)
+                pooled_prompt_embeds = self.empty_pooled_prompt_embeds.to(device).repeat(batch_size, 1)
+                text_ids = self.text_ids.to(device)
+
+                # guidance vector
+                guidance = torch.full([1], self.guidance_scale, device=device, dtype=torch.float32)
+                guidance = guidance.expand(batch_size)
+
                 # Sample timesteps & corresponding sigma
-                t, sigma_t = self.sample_timesteps_and_sigmas(batch_size, device)
+                t = torch.tensor(0., device=device, dtype=torch.float32)
+                t = t.expand(batch_size)
 
-                interp_latent = (1 - sigma_t) * gt_target_latent + sigma_t * latents
-                
-                target = latents - gt_target_latent
-
-                latent_model_input = torch.cat([rgb_latent, interp_latent], dim=1)
-
-                # Forward pass 1: u(z_t, t) = v(z_t, t), instantaneous velocity
-                model_pred = self.model.unet(
-                    latent_model_input,
-                    t,
-                    text_embed,
+                # One forward pass
+                model_pred = self.model.transformer(
+                    hidden_states=packed_rgb_latent,
+                    timestep=t / 1000,
+                    guidance=guidance,
+                    pooled_projections=pooled_prompt_embeds,
+                    encoder_hidden_states=prompt_embeds,
+                    txt_ids=text_ids,
+                    img_ids=rgb_latent_image_ids,
                     return_dict=False
                 )[0]
+
+                model_pred = self.model._unpack_latents(
+                    model_pred,
+                    height=height,
+                    width=width,
+                    vae_scale_factor=self.vae_scale_factor,
+                )
+
+                target = rgb_latent - gt_target_latent
 
                 # Loss
                 if self.gt_mask_type is not None:
@@ -456,6 +441,30 @@ class FluxDepthTrainer:
         # encode using VAE encoder
         depth_latent = self.model.encode_rgb(stacked)
         return depth_latent
+
+    def prepare_latents(self, images=None, latents=None):
+        assert images is not None or latents is not None, "either image or latents should be provided!"
+        if latents is None:
+            latents = self.encode_rgb(images)
+
+        batch_size, num_channels_latents, height, width = latents.shape
+        packed_latents = self.model._pack_latents(
+            latents,
+            batch_size=batch_size,
+            num_channels_latents=num_channels_latents,
+            height=height,
+            width=width,
+        )
+
+        latent_image_ids = self.model._prepare_latent_image_ids(
+            batch_size=batch_size,
+            height=height // 2,
+            width=width // 2,
+            device=latents.device,
+            dtype=latents.dtype
+        )
+
+        return latents, packed_latents, latent_image_ids
 
     @staticmethod
     def stack_depth_images(depth_in):
@@ -590,67 +599,61 @@ class FluxDepthTrainer:
                 generator.manual_seed(seed)
 
             # Predict depth for different inference_steps
-            for inference_step in self.cfg.validation.num_inference_steps:
-                pipe_out: SD2DepthOutput = self.model(
-                    rgb_int,
-                    num_inference_steps=inference_step,
-                    processing_res=self.cfg.validation.processing_res,
-                    match_input_res=self.cfg.validation.match_input_res,
-                    generator=generator,
-                    # batch_size=1,  # use batch size 1 to increase reproducibility
-                    color_map=None,
-                    show_progress_bar=False,
-                    # resample_method=self.cfg.validation.resample_method,
+            pipe_out: FluxDepthPipelineOutput = self.model(
+                rgb_int,
+                processing_res=self.cfg.validation.processing_res,
+                match_input_res=self.cfg.validation.match_input_res,
+                generator=generator,
+                color_map=None,
+                guidance_scale=self.guidance_scale,
+            )
+
+            depth_pred: np.ndarray = pipe_out.depth_np
+
+            if "least_square" == self.cfg.eval.alignment:
+                depth_pred, scale, shift = align_depth_least_square(
+                    gt_arr=depth_raw,
+                    pred_arr=depth_pred,
+                    valid_mask_arr=valid_mask,
+                    return_scale_shift=True,
+                    max_resolution=self.cfg.eval.align_max_res,
                 )
+            else:
+                raise RuntimeError(f"Unknown alignment type: {self.cfg.eval.alignment}")
 
-                depth_pred: np.ndarray = pipe_out.depth_np
+            # Clip to dataset min max
+            depth_pred = np.clip(
+                depth_pred,
+                a_min=data_loader.dataset.min_depth,
+                a_max=data_loader.dataset.max_depth,
+            )
 
-                if "least_square" == self.cfg.eval.alignment:
-                    depth_pred, scale, shift = align_depth_least_square(
-                        gt_arr=depth_raw,
-                        pred_arr=depth_pred,
-                        valid_mask_arr=valid_mask,
-                        return_scale_shift=True,
-                        max_resolution=self.cfg.eval.align_max_res,
-                    )
-                else:
-                    raise RuntimeError(f"Unknown alignment type: {self.cfg.eval.alignment}")
+            # clip to d > 0 for evaluation
+            depth_pred = np.clip(depth_pred, a_min=1e-6, a_max=None)
 
-                # Clip to dataset min max
-                depth_pred = np.clip(
-                    depth_pred,
-                    a_min=data_loader.dataset.min_depth,
-                    a_max=data_loader.dataset.max_depth,
-                )
+            # Evaluate
+            sample_metric = []
+            depth_pred_ts = torch.from_numpy(depth_pred).to(self.device)
 
-                # clip to d > 0 for evaluation
-                depth_pred = np.clip(depth_pred, a_min=1e-6, a_max=None)
+            for met_func in self.metric_funcs:
+                _metric_name = met_func.__name__
+                _metric = met_func(depth_pred_ts, depth_raw_ts, valid_mask_ts).item()
+                sample_metric.append(_metric.__str__())
+                metric_tracker.update(_metric_name, _metric)
 
-                # Evaluate
-                sample_metric = []
-                depth_pred_ts = torch.from_numpy(depth_pred).to(self.device)
-
-                for met_func in self.metric_funcs:
-                    _metric_name = met_func.__name__
-                    _metric = met_func(depth_pred_ts, depth_raw_ts, valid_mask_ts).item()
-                    sample_metric.append(_metric.__str__())
-                    metric_tracker.update(_metric_name, _metric)
-
-                # Save as 16-bit uint png
-                if save_to_dir is not None:
-                    img_name = batch["rgb_relative_path"][0].replace("/", "_")
-
-                    # save depth
-                    save_to_dir_depth = os.path.join(*[save_to_dir, "depth", f"{inference_step}_steps"])
-                    os.makedirs(save_to_dir_depth, exist_ok=True)
-
-                    png_save_path = os.path.join(save_to_dir_depth, f"{img_name}.png")
-                    depth_to_save = (pipe_out.depth_np * 65535.0).astype(np.uint16)
-                    Image.fromarray(depth_to_save).save(png_save_path, mode="I;16")
-            
-            # save image
+            # Save as 16-bit uint png
             if save_to_dir is not None:
                 img_name = batch["rgb_relative_path"][0].replace("/", "_")
+
+                # save depth
+                save_to_dir_depth = os.path.join(save_to_dir, "depth")
+                os.makedirs(save_to_dir_depth, exist_ok=True)
+
+                png_save_path = os.path.join(save_to_dir_depth, f"{img_name}.png")
+                depth_to_save = (pipe_out.depth_np * 65535.0).astype(np.uint16)
+                Image.fromarray(depth_to_save).save(png_save_path, mode="I;16")
+            
+                # save image            
                 save_to_dir_image = os.path.join(save_to_dir, "image")
                 os.makedirs(save_to_dir_image, exist_ok=True)
 
@@ -685,15 +688,10 @@ class FluxDepthTrainer:
             os.rename(ckpt_dir, temp_ckpt_dir)
             logging.debug(f"Old checkpoint is backed up at: {temp_ckpt_dir}")
 
-        # Save UNet
-        unet_path = os.path.join(ckpt_dir, "unet")
-        self.model.unet.save_pretrained(unet_path, safe_serialization=True)
-        logging.info(f"UNet is saved to: {unet_path}")
-
-        # Save scheduler
-        scheduelr_path = os.path.join(ckpt_dir, "scheduler")
-        self.model.scheduler.save_pretrained(scheduelr_path)
-        logging.info(f"Scheduler is saved to: {scheduelr_path}")
+        # Save Transformer
+        transformer_path = os.path.join(ckpt_dir, "transformer")
+        self.model.transformer.save_pretrained(transformer_path, safe_serialization=True)
+        logging.info(f"Transformer is saved to: {transformer_path}")
 
         if save_train_state:
             state = {
@@ -724,14 +722,13 @@ class FluxDepthTrainer:
         self, ckpt_path, load_trainer_state=True, resume_lr_scheduler=True
     ):
         logging.info(f"Loading checkpoint from: {ckpt_path}")
-        # Load UNet
-        _model_path = os.path.join(ckpt_path, "unet", "diffusion_pytorch_model.safetensors")
-        self.model.unet.load_state_dict(
+        # Load Transformer
+        _model_path = os.path.join(ckpt_path, "transformer", "diffusion_pytorch_model.safetensors")
+        self.model.transformer.load_state_dict(
             load_file(_model_path, device='cpu')
         )
-        # self.model.unet = self.model.unet.from_pretrained
-        self.model.unet.to(self.device)
-        logging.info(f"UNet parameters are loaded from {_model_path}")
+        self.model.transformer.to(self.device)
+        logging.info(f"Transformer parameters are loaded from {_model_path}")
 
         # Load training states
         if load_trainer_state:

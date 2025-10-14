@@ -3,14 +3,16 @@ import torch
 
 from diffusers import FluxPipeline
 
-pretrained_model_name_or_path = "black-forest-labs/FLUX.1-dev"
+pretrained_model_name_or_path = "/home/yhyun225/fluxdepth/checkpoint/FLUX.1-dev"
 prompt_embed_dir = "/home/yhyun225/fluxdepth/prompt_embeds"
 
 os.makedirs(prompt_embed_dir, exist_ok=True)
 
 text_encoding_pipeline = FluxPipeline.from_pretrained(
     pretrained_model_name_or_path, torch_dtype=torch.bfloat16,
-).to('cuda')
+) #.to('cuda')
+
+breakpoint()
 
 empty_prompt = ""
 with torch.no_grad():

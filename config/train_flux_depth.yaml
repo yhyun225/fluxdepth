@@ -4,15 +4,17 @@ base_config:
 - config/dataset_depth/dataset_train.yaml
 - config/dataset_depth/dataset_val.yaml
 - config/dataset_depth/dataset_vis.yaml
-- config/model_sdv2.yaml
+- config/model_flux.yaml
+
+mixed_precision: 'bf16'
 
 pipeline:
-  name: SD2DepthPipeline
+  name: FluxDepthPipeline
   kwargs:
     scale_invariant: true
     shift_invariant: true
     prediction_type: depth
-    default_processing_resolution: 768
+    default_processing_resolution: 1024
 
 depth_normalization:
   type: scale_shift_depth
@@ -26,26 +28,31 @@ augmentation:
 
 dataloader:
   num_workers: 2
-  effective_batch_size: 128
-  max_train_batch_size: 32
+  effective_batch_size: 64
+  max_train_batch_size: 16
   seed: 2024  # to ensure continuity when resuming from checkpoint
 
 trainer:
-  name: SD2DepthTrainer
-  training_noise_scheduler:
-    pretrained_path: stable-diffusion-2
+  name: FluxDepthTrainer
   init_seed: 2024  # use null to train w/o seeding
   save_period: 5000
-  backup_period: 2000
+  backup_period: 1000
   validation_period: 50000
   visualization_period: 500 #1000
 
-meanflow:
-  weighting_scheme: uniform #logit_normal
-  logit_mean: 0.0
-  logit_std: 1.0
-  mode_scale: 1.29
-  ratio_r_not_equal_t: 0.5
+# lora config
+lora:
+  rank: 64
+  alpha: 32
+  modules: ~
+prompt_embeds_dir: /home/yhyun225/fluxdepth/prompt_embeds
+
+# flux parameters
+guidance_scale: 1.0
+
+# GLOWD config
+max_iter_glowd: 5000
+
 
 gt_depth_type: depth_raw_norm
 gt_mask_type: valid_mask_raw
@@ -61,7 +68,7 @@ loss:
   kwargs:
     reduction: mean
 
-lr: 4.0e-05
+lr: 1.0e-04
 lr_scheduler:
   name: IterExponential
   kwargs:
@@ -69,11 +76,11 @@ lr_scheduler:
     final_ratio: 0.01
     warmup_steps: 100
 
-# Memory related configurations
+# Memory efficient training configurations
 use_8bit_adam: True
 allow_tf32: True
 enable_gradient_checkpointing: True
-enable_xformers_memory_efficient_attention: True
+enable_xformers_memory_efficient_attention: False
 
 # Light setting for the in-training validation and visualization
 validation:

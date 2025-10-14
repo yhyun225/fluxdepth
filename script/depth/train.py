@@ -44,7 +44,7 @@ from torch.utils.data import ConcatDataset, DataLoader
 from tqdm import tqdm
 from typing import List, Union
 
-from marigold import MarigoldDepthPipeline
+from flux import FluxDepthPipeline
 from src.dataset import BaseDepthDataset, DatasetMode, get_dataset
 from src.dataset.mixed_sampler import MixedBatchSampler
 from src.trainer import get_trainer_cls
@@ -98,7 +98,7 @@ if "__main__" == __name__:
         help="Save checkpoint and exit after X minutes.",
     )
     parser.add_argument(
-        "--no_wandb",
+        "--wandb",
         action="store_true",
         help="Run without Weights and Biases logging.",
     )
@@ -183,7 +183,7 @@ if "__main__" == __name__:
     logging.debug(f"config: {cfg}")
 
     # Initialize wandb
-    if not args.no_wandb:
+    if args.wandb:
         if resume_run is not None:
             wandb_id = load_wandb_job_id(out_dir_run)
             wandb_cfg_dict = {
@@ -221,35 +221,35 @@ if "__main__" == __name__:
             OmegaConf.save(config=cfg, f=f)
         logging.info(f"Config saved to {_output_path}")
         # Copy and tar code on the first run
-        _temp_code_dir = os.path.join(out_dir_run, "code_tar")
-        _code_snapshot_path = os.path.join(out_dir_run, "code_snapshot.tar")
-        os.system(
-            f"rsync --relative -arhvz --quiet --filter=':- .gitignore' --exclude '.git' . '{_temp_code_dir}'"
-        )
-        os.system(f"tar -cf {_code_snapshot_path} {_temp_code_dir}")
-        os.system(f"rm -rf {_temp_code_dir}")
-        logging.info(f"Code snapshot saved to: {_code_snapshot_path}")
+        # _temp_code_dir = os.path.join(out_dir_run, "code_tar")
+        # _code_snapshot_path = os.path.join(out_dir_run, "code_snapshot.tar")
+        # os.system(
+        #     f"rsync --relative -arhvz --quiet --filter=':- .gitignore' --exclude '.git' . '{_temp_code_dir}'"
+        # )
+        # os.system(f"tar -cf {_code_snapshot_path} {_temp_code_dir}")
+        # os.system(f"rm -rf {_temp_code_dir}")
+        # logging.info(f"Code snapshot saved to: {_code_snapshot_path}")
 
     # -------------------- Copy data to local scratch (Slurm) --------------------
-    if is_on_slurm() and (not args.do_not_copy_data):
-        # local scratch dir
-        original_data_dir = base_data_dir
-        base_data_dir = os.path.join(get_local_scratch_dir(), "Marigold_data")
-        # copy data
-        required_data_list = find_value_in_omegaconf("dir", cfg_data)
-        # if cfg_train.visualize.init_latent_path is not None:
-        #     required_data_list.append(cfg_train.visualize.init_latent_path)
-        required_data_list = list(set(required_data_list))
-        logging.info(f"Required_data_list: {required_data_list}")
-        for d in tqdm(required_data_list, desc="Copy data to local scratch"):
-            ori_dir = os.path.join(original_data_dir, d)
-            dst_dir = os.path.join(base_data_dir, d)
-            os.makedirs(os.path.dirname(dst_dir), exist_ok=True)
-            if os.path.isfile(ori_dir):
-                shutil.copyfile(ori_dir, dst_dir)
-            elif os.path.isdir(ori_dir):
-                shutil.copytree(ori_dir, dst_dir)
-        logging.info(f"Data copied to: {base_data_dir}")
+    # if is_on_slurm() and (not args.do_not_copy_data):
+    #     # local scratch dir
+    #     original_data_dir = base_data_dir
+    #     base_data_dir = os.path.join(get_local_scratch_dir(), "Marigold_data")
+    #     # copy data
+    #     required_data_list = find_value_in_omegaconf("dir", cfg_data)
+    #     # if cfg_train.visualize.init_latent_path is not None:
+    #     #     required_data_list.append(cfg_train.visualize.init_latent_path)
+    #     required_data_list = list(set(required_data_list))
+    #     logging.info(f"Required_data_list: {required_data_list}")
+    #     for d in tqdm(required_data_list, desc="Copy data to local scratch"):
+    #         ori_dir = os.path.join(original_data_dir, d)
+    #         dst_dir = os.path.join(base_data_dir, d)
+    #         os.makedirs(os.path.dirname(dst_dir), exist_ok=True)
+    #         if os.path.isfile(ori_dir):
+    #             shutil.copyfile(ori_dir, dst_dir)
+    #         elif os.path.isdir(ori_dir):
+    #             shutil.copytree(ori_dir, dst_dir)
+    #     logging.info(f"Data copied to: {base_data_dir}")
 
     # -------------------- Gradient accumulation steps --------------------
     eff_bs = cfg.dataloader.effective_batch_size
@@ -341,8 +341,8 @@ if "__main__" == __name__:
 
     # -------------------- Model --------------------
     _pipeline_kwargs = cfg.pipeline.kwargs if cfg.pipeline.kwargs is not None else {}
-    model = MarigoldDepthPipeline.from_pretrained(
-        os.path.join(base_ckpt_dir, cfg.model.pretrained_path), **_pipeline_kwargs
+    model = FluxDepthPipeline.from_pretrained(
+        os.path.join(base_ckpt_dir, cfg.model.pretrained_path), torch_dtype=torch.bfloat16, **_pipeline_kwargs
     )
 
     # -------------------- Trainer --------------------
