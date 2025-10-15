@@ -8,8 +8,8 @@ dataset:
       dir: hypersim_preprocessed/train #hypersim_processed_train.tar
       filenames: data_split/hypersim_depth/filename_list_train_filtered.txt
       resize_to_hw:
-      - 480
-      - 640
+      - 768 #480
+      - 1024 #640
     - name: vkitti_depth
       disp_name: vkitti_depth_train
       dir: virtual_kitti2

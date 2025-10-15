@@ -33,7 +33,7 @@ dataloader:
   seed: 2024  # to ensure continuity when resuming from checkpoint
 
 trainer:
-  name: FluxDepthTrainer
+  name: FluxDepthTrainerMultiGPU
   init_seed: 2024  # use null to train w/o seeding
   save_period: 5000
   backup_period: 1000
