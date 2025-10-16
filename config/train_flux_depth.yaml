@@ -29,7 +29,7 @@ augmentation:
 dataloader:
   num_workers: 2
   effective_batch_size: 32
-  max_train_batch_size: 4
+  max_train_batch_size: 8
   seed: 2024  # to ensure continuity when resuming from checkpoint
 
 trainer:
@@ -51,7 +51,9 @@ prompt_embeds_dir: /home/yhyun225/fluxdepth/prompt_embeds
 guidance_scale: 1.0
 
 # GLOWD config
-max_iter_glowd: 5000
+glowd:
+  max_step: 2000
+  interpolation: exponential # [linear, exponential, logarithmic]
 
 
 gt_depth_type: depth_raw_norm
@@ -68,7 +70,7 @@ loss:
   kwargs:
     reduction: mean
 
-lr: 3.0e-05
+lr: 1.0e-4 #3.0e-05
 lr_scheduler:
   name: IterExponential
   kwargs:
@@ -80,7 +82,7 @@ lr_scheduler:
 use_8bit_adam: True
 allow_tf32: True
 enable_gradient_checkpointing: True
-enable_xformers_memory_efficient_attention: False
+enable_xformers_memory_efficient_attention: False #True
 
 # Light setting for the in-training validation and visualization
 validation:

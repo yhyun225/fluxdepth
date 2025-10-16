@@ -33,6 +33,7 @@ import numpy as np
 import os
 import shutil
 import copy
+import math
 
 import torch
 from PIL import Image
@@ -199,17 +200,41 @@ class FluxDepthTrainer:
         self.global_seed_sequence: List = []  # consistent global seed sequence, used to seed random generator, to ensure consistency when resuming
 
         # TODO: Path interpolation
-        self.max_iter_glowd = self.cfg.max_iter_glowd
+        self.glowd_max_step = self.cfg.glowd.max_step
+        self.glowd_interpolation = self.cfg.glowd.interpolation
 
     
     def path_interpolation(
         self,
-        prior_source,
-        prior_target,
-        source,
-        target
+        prior_source: torch.Tensor,
+        prior_target: torch.Tensor,
+        source: torch.Tensor,
+        target: torch.Tensor,
+        step: int,
+        timestep_interval: Union[list, tuple] = [1, 0],
+        c: float = 1.5,
+        epsilon: float = 1e-8,
     ):
-        pass
+        if step >= self.glowd_max_step:
+            return source, target
+        
+        timestep_start, timestep_end = timestep_interval
+
+        # quantize timestep into flux training timesteps
+        t_idx = int(step / (self.glowd_max_step / self.num_train_timesteps))
+        t = self.training_sigmas[t_idx].detach().cpu().item()
+
+        if self.glowd_interpolation == "linear":
+            timestep = (1 - t) * timestep_start + t * timestep_end
+        elif self.glowd_interpolation == "exponential":
+            timestep = (math.exp(-c*t) - math.exp(-c)) / (1 - math.exp(-c))
+        elif self.glowd_interpolation == "logarithmic":
+            timestep = (1.0 - math.log(1 + c * t) / math.log(1 + c))
+
+        intermediate_source = prior_source * (1 - timestep) + source * timestep
+        intermediate_target = prior_target * (1 - timestep) + target * timestep
+
+        return timestep, intermediate_source, intermediate_target        
         
 
     def time_interpolation(self, source_latent, timesteps, target_latent, eps=5e-1):
@@ -313,7 +338,7 @@ class FluxDepthTrainer:
 
                 with torch.no_grad():
                     # Encode image
-                    rgb_latent, packed_rgb_latent, rgb_latent_image_ids = self.prepare_latents(images=rgb)
+                    rgb_latent = self.encode_rgb(rgb)
 
                     # Encode GT depth
                     gt_target_latent = self.encode_depth(
@@ -328,15 +353,26 @@ class FluxDepthTrainer:
                 # guidance vector
                 guidance = torch.full([1], self.guidance_scale, device=device, dtype=torch.float32)
                 guidance = guidance.expand(batch_size)
+                
+                # Sample timesteps & interpolate path
+                timestep, interp_rgb_latent, interp_gt_target_latent = self.path_interpolation(
+                    prior_source=torch.randn_like(rgb_latent),
+                    prior_target=rgb_latent,
+                    source=rgb_latent,
+                    target=gt_target_latent,
+                )
+                t = torch.tensor(timestep, device=device, dtype=torch.float32)
 
-                # Sample timesteps & corresponding sigma
-                t = torch.tensor(0., device=device, dtype=torch.float32)
-                t = t.expand(batch_size)
+                # t = torch.tensor(0., device=device, dtype=torch.float32)
+                # t = t.expand(batch_size)
+
+                # prepare latents
+                packed_rgb_latent, rgb_latent_image_ids = self.prepare(latents=interp_rgb_latent)
 
                 # One forward pass
                 model_pred = self.model.transformer(
                     hidden_states=packed_rgb_latent,
-                    timestep=t / 1000,
+                    timestep=t / 1000,      # t in [0, 1]
                     guidance=guidance,
                     pooled_projections=pooled_prompt_embeds,
                     encoder_hidden_states=prompt_embeds,
@@ -352,7 +388,7 @@ class FluxDepthTrainer:
                     vae_scale_factor=self.vae_scale_factor,
                 )
 
-                target = rgb_latent - gt_target_latent
+                target = interp_rgb_latent - interp_gt_target_latent
 
                 # Loss
                 if self.gt_mask_type is not None:
@@ -443,7 +479,7 @@ class FluxDepthTrainer:
         return depth_latent
 
     def prepare_latents(self, images=None, latents=None):
-        assert images is not None or latents is not None, "either image or latents should be provided!"
+        assert images is None and latents is None, "either image or latents should be provided!"
         if latents is None:
             latents = self.encode_rgb(images)
 
@@ -464,7 +500,7 @@ class FluxDepthTrainer:
             dtype=latents.dtype
         )
 
-        return latents, packed_latents, latent_image_ids
+        return packed_latents, latent_image_ids
 
     @staticmethod
     def stack_depth_images(depth_in):
