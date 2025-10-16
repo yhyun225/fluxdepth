@@ -75,7 +75,7 @@ class BaseDepthDataset(Dataset):
         resize_to_hw=None,
         move_invalid_to_far_plane: bool = True,
         rgb_transform=lambda x: x / 255.0 * 2 - 1,  #  [0, 255] -> [-1, 1],
-        target_type: Union["depth", "disparity", "sqrt_disparity"] = "depth",
+        target_type: str = "depth", # "depth", "disparity", "sqrt_disparity"
         **kwargs,
     ) -> None:
         super().__init__()
@@ -224,7 +224,7 @@ class BaseDepthDataset(Dataset):
         ).bool()
         return valid_mask
 
-    def _training_preprocess(self, rasters):
+    def _training_preprocess(self, rasters, epsilon=1e-8):
         # Augmentation
         if self.augm_args is not None:
             rasters = self._augment_data(rasters)
@@ -242,6 +242,10 @@ class BaseDepthDataset(Dataset):
                 rasters["depth_filled_linear"] = torch.sqrt(
                     depth2disparity(rasters["depth_filled_linear"]).clone()
                 )
+        elif self.target_type == "log_depth":
+            rasters["depth_raw_linear"] = torch.log(rasters["depth_raw_linear"] + epsilon).clone()
+            if self.has_filled_depth:
+                rasters["depth_filled_linear"] = torch.log(rasters["depth_filled_linear"] + epsilon).clone()
 
         # Normalization
         rasters["depth_raw_norm"] = self.depth_transform(
