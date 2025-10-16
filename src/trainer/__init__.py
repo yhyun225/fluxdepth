@@ -29,9 +29,11 @@
 # --------------------------------------------------------------------------
 
 from .flux_depth_trainer import FluxDepthTrainer
+from .flux_depth_multi_gpu_trainer import FluxDepthMultiGPUTrainer
 
 trainer_cls_name_dict = {
     "FluxDepthTrainer": FluxDepthTrainer,
+    "FluxDepthMultiGPUTrainer": FluxDepthMultiGPUTrainer,
 }
 
 def get_trainer_cls(trainer_name):

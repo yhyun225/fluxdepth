@@ -138,10 +138,15 @@ class FluxDepthPipeline(DiffusionPipeline):
 
         return latents, latent_image_ids
     
-    def load_prompt_embeds(self, prompt_embed_dir: str):
-        self.empty_prompt_embeds = torch.load(os.path.join(prompt_embed_dir, "prompt_embeds.pt"))
-        self.empty_pooled_prompt_embeds = torch.load(os.path.join(prompt_embed_dir, "pooled_prompt_embeds.pt"))
-        self.text_ids = torch.load(os.path.join(prompt_embed_dir, "text_ids.pt"))
+    def load_prompt_embeds(
+        self,
+        prompt_embeds,
+        pooled_prompt_embeds,
+        text_ids,
+    ):
+        self.empty_prompt_embeds = prompt_embeds
+        self.empty_pooled_prompt_embeds = pooled_prompt_embeds
+        self.text_ids = text_ids
 
     @staticmethod
     def _prepare_latent_image_ids(batch_size, height, width, device, dtype):

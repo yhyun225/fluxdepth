@@ -66,15 +66,16 @@ from src.util.flux_utils import (
 
 from diffusers import DDPMScheduler
 from diffusers.training_utils import compute_density_for_timestep_sampling
+from diffusers.optimization import get_scheduler
 from safetensors.torch import load_file
 
-class FluxDepthTrainer:
+class FluxDepthMultiGPUTrainer:
     def __init__(
         self,
+        accelerator: Accelerator,
         cfg: OmegaConf,
         model: FluxDepthPipeline,
         train_dataloader: DataLoader,
-        device,  # NOTE: no need
         out_dir_ckpt,
         out_dir_eval,
         out_dir_vis,
@@ -84,7 +85,7 @@ class FluxDepthTrainer:
     ):
         self.cfg: OmegaConf = cfg
         self.model: FluxDepthPipeline = model
-        self.device = device
+        self.device = accelerator.device
         self.seed: Union[int, None] = (
             self.cfg.trainer.init_seed
         )  # used to generate seed sequence, set to `None` to train w/o seeding
@@ -96,11 +97,21 @@ class FluxDepthTrainer:
         self.vis_loaders: List[DataLoader] = vis_dataloaders
         self.accumulation_steps: int = accumulation_steps
 
+        # Accelerator
+        self.accelerator = accelerator
+        self.is_master = self.accelerator.is_main_process
+
         # Encode empty text prompt
-        self.model.load_prompt_embeds(self.cfg.prompt_embeds_dir)
-        self.empty_prompt_embeds = self.model.empty_prompt_embeds.detach().clone().to(device)
-        self.empty_pooled_prompt_embeds = self.model.empty_pooled_prompt_embeds.detach().clone().to(device)
-        self.text_ids = self.model.text_ids.detach().clone().to(device)
+        prompt_path = self.cfg.prompt_embeds.dir
+        prompt_embeds = torch.load(os.path.join(prompt_path, "prompt_embeds.pt"), weights_only=True, map_location=self.device)
+        pooled_prompt_embeds = torch.load(os.path.join(prompt_path, "pooled_prompt_embeds.pt"), weights_only=True, map_location=self.device)
+        text_ids = torch.load(os.path.join(prompt_path, "text_ids.pt"), weights_only=True, map_location=self.device)
+
+        self.model.load_prompt_embeds(
+            prompt_embeds=prompt_embeds,
+            pooled_prompt_embeds=pooled_prompt_embeds,
+            text_ids=text_ids
+        )
 
         # Trainability
         weight_dtype = torch.float32
@@ -145,12 +156,20 @@ class FluxDepthTrainer:
             self.optimizer = Adam(trainable_parameters, lr=lr)
 
         # LR scheduler
-        lr_func = IterExponential(
-            total_iter_length=self.cfg.lr_scheduler.kwargs.total_iter,
-            final_ratio=self.cfg.lr_scheduler.kwargs.final_ratio,
-            warmup_steps=self.cfg.lr_scheduler.kwargs.warmup_steps,
+        # lr_func = IterExponential(
+        #     total_iter_length=self.cfg.lr_scheduler.kwargs.total_iter,
+        #     final_ratio=self.cfg.lr_scheduler.kwargs.final_ratio,
+        #     warmup_steps=self.cfg.lr_scheduler.kwargs.warmup_steps,
+        # )
+        # self.lr_scheduler = LambdaLR(optimizer=self.optimizer, lr_lambda=lr_func)
+        self.lr_scheduler = get_scheduler(
+            self.cfg.lr_scheduler.name,
+            optimizer=self.optimizer,
+            num_warmup_steps=self.cfg.lr_scheduler.warmup_steps * self.accelerator.num_processes,
+            num_training_steps=self.cfg.max_iter * self.accelerator.num_processes,
+            num_cycles=self.cfg.lr_scheduler.num_cycles,
+            power=self.cfg.lr_scheduler.power,
         )
-        self.lr_scheduler = LambdaLR(optimizer=self.optimizer, lr_lambda=lr_func)
 
         # Loss
         self.loss = get_loss(loss_name=self.cfg.loss.name, **self.cfg.loss.kwargs)
@@ -289,7 +308,8 @@ class FluxDepthTrainer:
 
 
     def train(self, t_end=None):
-        logging.info("Start training")
+        if self.is_master:
+            logging.info("Start training")
 
         device = self.device
         self.model.to(device)
@@ -305,159 +325,153 @@ class FluxDepthTrainer:
     
         for epoch in range(self.epoch, self.max_epoch + 1):
             self.epoch = epoch
-            logging.debug(f"epoch: {self.epoch}")
+            if self.is_master:
+                logging.debug(f"epoch: {self.epoch}")
 
             # Skip previous batches when resume
-            for batch in skip_first_batches(self.train_loader, self.n_batch_in_epoch):
-                self.model.transformer.train()
+            for batch in self.train_loader: #skip_first_batches(self.train_loader, self.n_batch_in_epoch):
+                models_to_accumulate = [self.model.transformer]
+                with self.accelerator.accumulate(models_to_accumulate)
+                    self.model.transformer.train()
 
-                # globally consistent random generators
-                if self.seed is not None:
-                    local_seed = self._get_next_seed()
-                    rand_num_generator = torch.Generator(device=device)
-                    rand_num_generator.manual_seed(local_seed)
-                else:
-                    rand_num_generator = None
+                    # globally consistent random generators
+                    if self.seed is not None:
+                        local_seed = self._get_next_seed()
+                        rand_num_generator = torch.Generator(device=device)
+                        rand_num_generator.manual_seed(local_seed)
+                    else:
+                        rand_num_generator = None
 
-                # >>> With gradient accumulation >>>
+                    # Get data
+                    rgb = batch["rgb_norm"].to(device)                              # [b, 3, H, W]
+                    depth_gt_for_latent = batch[self.gt_depth_type].to(device)
 
-                # Get data
-                rgb = batch["rgb_norm"].to(device)                              # [b, 3, H, W]
-                depth_gt_for_latent = batch[self.gt_depth_type].to(device)
+                    batch_size, _, height, width = rgb.shape
 
-                batch_size, _, height, width = rgb.shape
+                    if self.gt_mask_type is not None:
+                        num_channels_latents = self.model.transformer.config.in_channels // 4
+                        valid_mask_for_latent = batch[self.gt_mask_type].to(device)
+                        invalid_mask = ~valid_mask_for_latent
+                        valid_mask_down = ~torch.max_pool2d(
+                            invalid_mask.float(), 8, 8
+                        ).bool()
+                        valid_mask_down = valid_mask_down.repeat((1, num_channels_latents, 1, 1))
 
-                if self.gt_mask_type is not None:
-                    num_channels_latents = self.model.transformer.config.in_channels // 4
-                    valid_mask_for_latent = batch[self.gt_mask_type].to(device)
-                    invalid_mask = ~valid_mask_for_latent
-                    valid_mask_down = ~torch.max_pool2d(
-                        invalid_mask.float(), 8, 8
-                    ).bool()
-                    valid_mask_down = valid_mask_down.repeat((1, num_channels_latents, 1, 1))
+                    with torch.no_grad():
+                        # Encode image
+                        rgb_latent = self.encode_rgb(rgb)
 
-                with torch.no_grad():
-                    # Encode image
-                    rgb_latent = self.encode_rgb(rgb)
+                        # Encode GT depth
+                        gt_target_latent = self.encode_depth(
+                            depth_gt_for_latent
+                        )  # [B, 4, h, w]
 
-                    # Encode GT depth
-                    gt_target_latent = self.encode_depth(
-                        depth_gt_for_latent
-                    )  # [B, 4, h, w]
+                    # Text embedding
+                    prompt_embeds = self.empty_prompt_embeds.to(device).repeat(batch_size, 1, 1)
+                    pooled_prompt_embeds = self.empty_pooled_prompt_embeds.to(device).repeat(batch_size, 1)
+                    text_ids = self.text_ids.to(device)
 
-                # Text embedding
-                prompt_embeds = self.empty_prompt_embeds.to(device).repeat(batch_size, 1, 1)
-                pooled_prompt_embeds = self.empty_pooled_prompt_embeds.to(device).repeat(batch_size, 1)
-                text_ids = self.text_ids.to(device)
-
-                # guidance vector
-                guidance = torch.full([1], self.guidance_scale, device=device, dtype=torch.float32)
-                guidance = guidance.expand(batch_size)
+                    # guidance vector
+                    guidance = torch.full([1], self.guidance_scale, device=device, dtype=torch.float32)
+                    guidance = guidance.expand(batch_size)
                 
-                # Sample timesteps & interpolate path
-                timestep, interp_rgb_latent, interp_gt_target_latent = self.path_interpolation(
-                    prior_source=torch.randn_like(rgb_latent),
-                    prior_target=rgb_latent,
-                    source=rgb_latent,
-                    target=gt_target_latent,
-                )
-                t = torch.tensor(timestep, device=device, dtype=torch.float32)
+                    # Sample timesteps & interpolate path
+                    timestep, interp_rgb_latent, interp_gt_target_latent = self.path_interpolation(
+                        prior_source=torch.randn_like(rgb_latent),
+                        prior_target=rgb_latent,
+                        source=rgb_latent,
+                        target=gt_target_latent,
+                        step=self.effective_iter,
+                    )
+                    t = torch.tensor(timestep, device=device, dtype=torch.float32)
 
                 # t = torch.tensor(0., device=device, dtype=torch.float32)
                 # t = t.expand(batch_size)
 
-                # prepare latents
-                packed_rgb_latent, rgb_latent_image_ids = self.prepare(latents=interp_rgb_latent)
+                    # prepare latents
+                    packed_rgb_latent, rgb_latent_image_ids = self.prepare(latents=interp_rgb_latent)
 
-                # One forward pass
-                model_pred = self.model.transformer(
-                    hidden_states=packed_rgb_latent,
-                    timestep=t / 1000,      # t in [0, 1]
-                    guidance=guidance,
-                    pooled_projections=pooled_prompt_embeds,
-                    encoder_hidden_states=prompt_embeds,
-                    txt_ids=text_ids,
-                    img_ids=rgb_latent_image_ids,
-                    return_dict=False
-                )[0]
+                    # One forward pass
+                    model_pred = self.model.transformer(
+                        hidden_states=packed_rgb_latent,
+                        timestep=t / 1000,      # t in [0, 1]
+                        guidance=guidance,
+                        pooled_projections=pooled_prompt_embeds,
+                        encoder_hidden_states=prompt_embeds,
+                        txt_ids=text_ids,
+                        img_ids=rgb_latent_image_ids,
+                        return_dict=False
+                    )[0]
 
-                model_pred = self.model._unpack_latents(
-                    model_pred,
-                    height=height,
-                    width=width,
-                    vae_scale_factor=self.vae_scale_factor,
-                )
-
-                target = interp_rgb_latent - interp_gt_target_latent
-
-                # Loss
-                if self.gt_mask_type is not None:
-                    latent_loss = self.loss(
-                        model_pred[valid_mask_down].float(),
-                        target[valid_mask_down].float(),
+                    model_pred = self.model._unpack_latents(
+                        model_pred,
+                        height=height,
+                        width=width,
+                        vae_scale_factor=self.vae_scale_factor,
                     )
-                else:
-                    latent_loss = self.loss(model_pred.float(), target.float())
 
-                loss = latent_loss.mean()
+                    target = interp_rgb_latent - interp_gt_target_latent
 
-                self.train_metrics.update("loss", loss.item())
+                    # Loss
+                    if self.gt_mask_type is not None:
+                        latent_loss = self.loss(
+                            model_pred[valid_mask_down].float(),
+                            target[valid_mask_down].float(),
+                        )
+                    else:
+                        latent_loss = self.loss(model_pred.float(), target.float())
 
-                loss = loss / self.gradient_accumulation_steps
-                loss.backward()
-                accumulated_step += 1
+                    loss = latent_loss.mean()
+                    self.train_metrics.update("loss", loss.item())
 
-                self.n_batch_in_epoch += 1
-                # Practical batch end
-
-                # Perform optimization step
-                if accumulated_step >= self.gradient_accumulation_steps:
+                    self.accelerator.backward(loss)
                     self.optimizer.step()
                     self.lr_scheduler.step()
-                    self.optimizer.zero_grad()
-                    accumulated_step = 0
 
+                    self.n_batch_in_epoch += 1
+                    # Practical batch end
+
+                # Perform optimization step
+                if self.accelerator.sync_gradients:
                     self.effective_iter += 1
-
-                    # Log to tensorboard
-                    accumulated_loss = self.train_metrics.result()["loss"]
-                    tb_logger.log_dict(
-                        {
-                            f"train/{k}": v
-                            for k, v in self.train_metrics.result().items()
-                        },
-                        global_step=self.effective_iter,
-                    )
-                    tb_logger.writer.add_scalar(
-                        "lr",
-                        self.lr_scheduler.get_last_lr()[0],
-                        global_step=self.effective_iter,
-                    )
-                    tb_logger.writer.add_scalar(
-                        "n_batch_in_epoch",
-                        self.n_batch_in_epoch,
-                        global_step=self.effective_iter,
-                    )
-                    logging.info(
-                        f"iter {self.effective_iter:5d} (epoch {epoch:2d}): loss={accumulated_loss:.5f}"
-                    )
-                    self.train_metrics.reset()
+                    if self.is_master:
+                        # Log to tensorboard
+                        accumulated_loss = self.train_metrics.result()["loss"]
+                        tb_logger.log_dict(
+                            {
+                                f"train/{k}": v
+                                for k, v in self.train_metrics.result().items()
+                            },
+                            global_step=self.effective_iter,
+                        )
+                        tb_logger.writer.add_scalar(
+                            "lr",
+                            self.lr_scheduler.get_last_lr()[0],
+                            global_step=self.effective_iter,
+                        )
+                        tb_logger.writer.add_scalar(
+                            "n_batch_in_epoch",
+                            self.n_batch_in_epoch,
+                            global_step=self.effective_iter,
+                        )
+                        logging.info(
+                            f"iter {self.effective_iter:5d} (epoch {epoch:2d}): loss={accumulated_loss:.5f}"
+                        )
+                        self.train_metrics.reset()
 
                     # Per-step callback
                     self._train_step_callback()
+                    self.accelerator.wait_for_everyone()
 
                     # End of training
-                    if self.max_iter > 0 and self.effective_iter >= self.max_iter:
+                    if self.max_iter > 0 and self.effective_iter >= self.max_iter and self.is_master:
+                        self.wait_for_everyone()
                         self.save_checkpoint(
                             ckpt_name=self._get_backup_ckpt_name(),
                             save_train_state=False,
                         )
+                        self.accelerator.end_training()
                         logging.info("Training ended.")
-                        return
-                    # Time's up
-                    elif t_end is not None and datetime.now() >= t_end:
-                        self.save_checkpoint(ckpt_name="latest", save_train_state=True)
-                        logging.info("Time is up, training paused.")
                         return
 
                     torch.cuda.empty_cache()
